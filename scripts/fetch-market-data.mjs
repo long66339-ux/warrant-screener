@@ -11,24 +11,50 @@ async function fetchJson(key, url) {
   let lastError;
   for (let attempt = 1; attempt <= 4; attempt += 1) {
     try {
-      const response = await fetch(url, { headers: { accept: "application/json" } });
+      console.log(`Fetching ${key} (attempt ${attempt}/4)...`);
+      const response = await fetch(url, {
+        headers: {
+          accept: "application/json",
+          "accept-encoding": "identity",
+          "user-agent": "tw-warrant-screener/1.0 (+https://github.com/long66339-ux/warrant-screener)",
+        },
+        signal: AbortSignal.timeout(45_000),
+      });
       if (!response.ok) throw new Error(`${key} ${response.status}`);
       return await response.json();
     } catch (error) {
       lastError = error;
+      console.warn(`${key} attempt ${attempt} failed: ${error?.message ?? error}`);
       if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, attempt * 750));
     }
   }
   throw lastError;
 }
 
-const entries = [];
-for (const [key, url] of Object.entries(sources)) entries.push([key, await fetchJson(key, url)]);
+// An official endpoint occasionally resets long-lived connections. Keep the
+// deployment usable with whichever official snapshots succeeded; the UI
+// explicitly marks unavailable fields instead of inventing data.
+const results = await Promise.allSettled(
+  Object.entries(sources).map(async ([key, url]) => [key, await fetchJson(key, url)]),
+);
+const entries = results
+  .filter((result) => result.status === "fulfilled")
+  .map((result) => result.value);
 const raw = Object.fromEntries(entries);
+
+for (const result of results) {
+  if (result.status === "rejected") {
+    console.warn(`Official source unavailable for this build: ${result.reason?.message ?? result.reason}`);
+  }
+}
+
+if (!entries.length) {
+  console.warn("All official sources are temporarily unavailable; writing an empty, non-fabricated snapshot.");
+}
 const compact = {
   twse: {
-    stat: raw.twse?.stat,
-    date: raw.twse?.date,
+    stat: raw.twse?.stat ?? "unavailable",
+    date: raw.twse?.date ?? null,
     data: (raw.twse?.data ?? []).map((row) => {
       const selected = [];
       for (const index of [0, 1, 2, 4, 5, 6, 8, 13, 14, 15]) selected[index] = row[index];
