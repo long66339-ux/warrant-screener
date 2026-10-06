@@ -78,6 +78,19 @@ test("四層逐步放寬會標示最早符合的層級", () => {
   assert.equal(earliestSelectionLevel(warrant("L3", { days: 50, moneyness: -15, lastPrice: 0.7 })), 3);
 });
 
+test("人工數據重評後仍保留初篩被選入的層級", () => {
+  const row = warrant("KEEP", {
+    selectionLevel: 1,
+    delta: "0.024",
+    bid: "1.99",
+    ask: "2.01",
+    bidQty: "200",
+    askQty: "200",
+  });
+  assert.equal(earliestSelectionLevel(row), 4);
+  assert.equal(scoreRows([row], "balanced")[0].row.selectionLevel, 1);
+});
+
 test("交易模式會改變同層候選排序", () => {
   const rows = [
     warrant("LONG", { days: 330, moneyness: 5 }),

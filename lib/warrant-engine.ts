@@ -465,7 +465,10 @@ export function scoreRows(rows: Warrant[], strategy: Strategy): ScoredWarrant[] 
       else marketGrade = "red";
     }
     return {
-      row: { ...row, selectionLevel: earliestSelectionLevel(row) ?? 4 },
+      // Keep the level at which the warrant entered the initial candidate set.
+      // Manual metrics may change its score and warnings, but must not rewrite
+      // the historical selection-level label shown to the user.
+      row: { ...row, selectionLevel: row.selectionLevel ?? earliestSelectionLevel(row) ?? 4 },
       final,
       rawScore,
       completeness,
