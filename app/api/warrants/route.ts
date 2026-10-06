@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { pickInitialCandidates as selectWithLevels, type Warrant } from "@/lib/warrant-engine";
 
 export const runtime = "edge";
 
@@ -61,18 +62,6 @@ function parseDate(value: unknown) {
   const year = parts[0] < 1911 ? parts[0] + 1911 : parts[0];
   const date = new Date(Date.UTC(year, parts[1] - 1, parts[2]));
   return Number.isNaN(date.getTime()) ? null : date;
-}
-
-function discoverPath(spec: Raw, phrases: string[]) {
-  const paths = (spec.paths ?? {}) as Record<string, Raw>;
-  for (const [path, methods] of Object.entries(paths)) {
-    const get = (methods as Raw).get as Raw | undefined;
-    const haystack = [get?.summary, get?.description, ...(Array.isArray(get?.tags) ? get.tags : [])]
-      .map(tidy)
-      .join(" ");
-    if (phrases.some((phrase) => haystack.includes(phrase))) return path;
-  }
-  return null;
 }
 
 async function json(url: string) {
@@ -178,66 +167,8 @@ function normalize(row: Raw, source: string, stockPrice: number | null): Candida
   };
 }
 
-function initialScore(w: Candidate) {
-  const days = w.days ?? 0;
-  const dayScore = Math.max(0, Math.min(1, (days - 60) / 300));
-  const ratio = w.ratio ?? 0;
-  const ratioScore = Math.max(0, Math.min(1, ratio / 0.05));
-  if (w.moneyness === null) return Math.round((dayScore * 0.62 + ratioScore * 0.38) * 100);
-  const distance = Math.abs(w.moneyness);
-  const moneyScore = 1 / (1 + Math.pow(distance / 7, 1.6));
-  const excessPenalty = Math.max(0, distance - 20) * 1.5;
-  return Math.round(Math.max(0, Math.min(100, (dayScore * 0.4 + moneyScore * 0.4 + ratioScore * 0.2) * 100 - excessPenalty)));
-}
-
-function premiumRate(w: Candidate) {
-  if (!w.lastPrice || !w.underlyingPrice || !w.strike || !w.ratio) return null;
-  const exerciseCost = w.lastPrice / w.ratio;
-  return (w.kind === "put"
-    ? (w.underlyingPrice - w.strike + exerciseCost) / w.underlyingPrice
-    : (w.strike + exerciseCost - w.underlyingPrice) / w.underlyingPrice) * 100;
-}
-
-function refinedScore(w: Candidate, strategy: Strategy) {
-  const dayScore = Math.max(0, Math.min(1, ((w.days ?? 0) - 90) / 300));
-  const ratioScore = Math.max(0, Math.min(1, (w.ratio ?? 0) / 0.05));
-  if (w.moneyness === null) {
-    const dayWeight = strategy === "longTerm" ? 0.82 : strategy === "aggressive" ? 0.5 : 0.68;
-    return Math.round((dayScore * dayWeight + ratioScore * (1 - dayWeight)) * 100);
-  }
-  const distance = Math.abs(w.moneyness);
-  const moneyScore = 1 / (1 + Math.pow(distance / 6, 1.85));
-  const balanceScore = 1 - (Math.max(dayScore, moneyScore, ratioScore) - Math.min(dayScore, moneyScore, ratioScore));
-  const excessPenalty = Math.max(0, distance - 20) * 2;
-  const premium = premiumRate(w);
-  const premiumScore = premium === null ? 0.5 : 1 - Math.max(0, Math.min(1, Math.max(0, premium) / 20));
-  const simpleGearing = w.lastPrice && w.underlyingPrice && w.ratio ? (w.underlyingPrice * w.ratio) / w.lastPrice : null;
-  const gearingScore = simpleGearing === null ? 0.45 : Math.max(0, Math.min(1, (simpleGearing - 1) / 12));
-  const aggressiveMoney = 1 / (1 + Math.pow(Math.abs(w.moneyness + 8) / 8, 1.6));
-  const stockLikeMoney = 1 / (1 + Math.pow(Math.abs(w.moneyness - 5) / 7, 1.7));
-  const raw = strategy === "lowCost"
-    ? dayScore * 0.25 + moneyScore * 0.25 + ratioScore * 0.15 + premiumScore * 0.35
-    : strategy === "longTerm"
-      ? dayScore * 0.6 + moneyScore * 0.2 + ratioScore * 0.15 + balanceScore * 0.05
-      : strategy === "aggressive"
-        ? dayScore * 0.2 + aggressiveMoney * 0.25 + ratioScore * 0.15 + gearingScore * 0.4
-        : strategy === "stockLike"
-          ? dayScore * 0.35 + stockLikeMoney * 0.4 + ratioScore * 0.15 + moneyScore * 0.1
-          : dayScore * 0.38 + moneyScore * 0.42 + ratioScore * 0.15 + balanceScore * 0.05;
-  return Math.round(Math.max(0, Math.min(100, raw * 100 - excessPenalty)));
-}
-
 function selectCandidates(rows: Candidate[], strategy: Strategy) {
-  const byScore = (a: Candidate, b: Candidate) => b.score - a.score || (b.days ?? 0) - (a.days ?? 0);
-  const pool = rows
-    .map((w) => ({ ...w, score: initialScore(w) }))
-    .sort(byScore)
-    .slice(0, 20);
-  const candidates = pool
-    .map((w) => ({ ...w, score: refinedScore(w, strategy) }))
-    .sort(byScore)
-    .slice(0, 8);
-  return { poolSize: pool.length, candidates };
+  return selectWithLevels(rows as Warrant[], strategy);
 }
 
 export async function GET(request: NextRequest) {
