@@ -44,6 +44,7 @@ const MANUAL_FIELDS = [
   "bidIv", "askIv", "iv5dChange", "iv10dChange", "iv20dChange", "ivStd",
   "spreadStd", "quoteStopCount", "depthDropCount", "upMoveBidIvDropCount",
 ] as const satisfies readonly (keyof Warrant)[];
+type ManualField = typeof MANUAL_FIELDS[number];
 const fmt = (value: number | null | undefined, digits = 2) =>
   value === null || value === undefined || !Number.isFinite(value)
     ? "待補"
@@ -58,6 +59,91 @@ function parseRocDate(value: unknown) {
   const year = parts[0] < 1911 ? parts[0] + 1911 : parts[0];
   const date = new Date(year, parts[1] - 1, parts[2]);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+type YuantaCompactRow = {
+  c: string; n: string; k: "call" | "put"; i: string; u: string; un: string;
+  s: number | null; lp: number | null; v: number | null; b: number | null; bq: number | null;
+  a: number | null; aq: number | null; e: string | null; o: number | null; x: number | null;
+  r: number | null; d: number | null; ci: number | null; bi: number | null; ai: number | null;
+  dl: number | null; m: number | null; g: number | null; sp: number | null;
+};
+
+type YuantaIndex = {
+  available?: boolean;
+  fetchedAt?: string;
+  marketTime?: string | null;
+  coverage?: { rows: number; issuers: number; delta: number; bidIv: number; askIv: number };
+  underlyings?: Record<string, { name: string; count: number; file: string }>;
+};
+
+const inputString = (value: number | null | undefined) => value === null || value === undefined ? "" : String(value);
+
+async function scanYuantaSnapshot(input: string, kind: "call" | "put", strategy: Strategy) {
+  const indexResponse = await fetch("./yuanta/index.json", { cache: "no-store" });
+  if (!indexResponse.ok) throw new Error("元大補充資料快照尚未建立");
+  const index = await indexResponse.json() as YuantaIndex;
+  if (!index.available || !index.underlyings) throw new Error("本次建置未取得元大補充資料");
+  const query = input.trim().replace(/\s/g, "").toLowerCase();
+  const entries = Object.entries(index.underlyings);
+  let matched = entries.find(([code]) => code.toLowerCase() === query);
+  if (!matched) matched = entries.find(([, item]) => item.name.replace(/\s/g, "").toLowerCase() === query);
+  if (!matched) {
+    const partial = entries.filter(([, item]) => item.name.replace(/\s/g, "").toLowerCase().includes(query));
+    if (partial.length === 1) matched = partial[0];
+  }
+  if (!matched) throw new Error("元大資料中找不到這檔標的");
+  const [underlyingCode, meta] = matched;
+  const response = await fetch(`./yuanta/${meta.file}`, { cache: "no-store" });
+  if (!response.ok) throw new Error("元大標的資料檔不完整");
+  const snapshot = await response.json() as {
+    fetchedAt: string; marketTime?: string | null; underlyingName: string; warrants: YuantaCompactRow[];
+  };
+  const matches = snapshot.warrants.filter((raw) => raw.k === kind).map((raw): Warrant => ({
+    id: raw.c,
+    code: raw.c,
+    name: raw.n,
+    issuer: inferIssuer(raw.n),
+    expiry: raw.e,
+    days: raw.d,
+    strike: raw.x,
+    ratio: raw.r,
+    underlyingCode,
+    underlyingName: raw.un || snapshot.underlyingName,
+    underlyingPrice: raw.s,
+    lastPrice: raw.lp,
+    moneyness: raw.m,
+    kind: raw.k,
+    score: 0,
+    source: "YUANTA",
+    iv: inputString(raw.ci),
+    delta: inputString(raw.dl),
+    deltaInputSource: raw.dl === null ? undefined : "yuanta",
+    bid: inputString(raw.b),
+    ask: inputString(raw.a),
+    bidQty: inputString(raw.bq),
+    askQty: inputString(raw.aq),
+    outstandingRatio: inputString(raw.o),
+    volume: inputString(raw.v),
+    bidIv: inputString(raw.bi),
+    askIv: inputString(raw.ai),
+    reportedGearing: raw.g,
+    quoteAt: snapshot.marketTime ?? snapshot.fetchedAt,
+    dataFetchedAt: snapshot.fetchedAt,
+    dataMarketTime: snapshot.marketTime ?? null,
+  }));
+  if (!matches.length) throw new Error("元大資料中沒有符合認購／認售類型的權證");
+  const selection = pickInitialCandidates(matches, strategy);
+  const issuerCount = new Set(matches.map((row) => row.issuer ?? row.name)).size;
+  return {
+    ...selection,
+    totalMatched: matches.length,
+    date: snapshot.marketTime ?? null,
+    market: "YUANTA",
+    source: "YUANTA" as const,
+    issuerCount,
+    coverage: index.coverage,
+  };
 }
 
 async function scanOfficialDirect(input: string, kind: "call" | "put", strategy: Strategy) {
@@ -170,8 +256,11 @@ async function scanOfficialDirect(input: string, kind: "call" | "put", strategy:
   return { ...selection, totalMatched: tpexMatches.length, date: String(issues[0]?.Date ?? "") || null, market: "TPEx" };
 }
 
-function DataTag({ type }: { type: "AUTO" | "MANUAL" | "CALCULATED" }) {
-  const styles = type === "AUTO" ? "border-sky-400/30 text-sky-300" : type === "MANUAL" ? "border-amber-400/30 text-amber-300" : "border-violet-400/30 text-violet-300";
+function DataTag({ type }: { type: "AUTO" | "YUANTA" | "MANUAL" | "CALCULATED" }) {
+  const styles = type === "AUTO" ? "border-sky-400/30 text-sky-300"
+    : type === "YUANTA" ? "border-emerald-400/30 text-emerald-300"
+      : type === "MANUAL" ? "border-amber-400/30 text-amber-300"
+        : "border-violet-400/30 text-violet-300";
   return <span className={`ml-1 rounded border px-1 py-0.5 font-mono text-[10px] ${styles}`}>{type}</span>;
 }
 
@@ -244,6 +333,7 @@ export default function Home() {
       return b.final - a.final;
     });
   }, [modelRows, analyzed, strategy]);
+  const autoEnriched = modelRows.some((row) => row.source === "YUANTA");
 
   const categories = useMemo(() => {
     if (!modelRows.length) return [];
@@ -274,24 +364,33 @@ export default function Home() {
     setLoading(true);
     setSourceNote("");
     try {
-      let data: { candidates: Warrant[]; totalMatched: number; poolSize: number; date?: string | null };
+      let data: {
+        candidates: Warrant[]; totalMatched: number; poolSize: number; date?: string | null;
+        source?: "YUANTA" | "OFFICIAL"; issuerCount?: number;
+        coverage?: { rows: number; issuers: number; delta: number; bidIv: number; askIv: number };
+      };
       try {
-        data = await scanOfficialDirect(query.trim(), kind, strategy);
+        data = await scanYuantaSnapshot(query.trim(), kind, strategy);
       } catch {
-        const canUseServerFallback = location.hostname.endsWith("chatgpt.site") || location.hostname === "terminal.local";
-        if (!canUseServerFallback) throw new Error("證交所暫時無法直接連線，請稍後重試或使用手動匯入");
-        const response = await fetch(`/api/warrants?q=${encodeURIComponent(query.trim())}&kind=${kind}&strategy=${strategy}`);
-        const fallback = await response.json() as {
-          detail?: string; error?: string; candidates?: Warrant[]; totalMatched?: number; poolSize?: number;
-          source?: { marketDate?: string | null };
-        };
-        if (!response.ok) throw new Error(fallback.detail ?? fallback.error);
-        data = {
-          candidates: fallback.candidates ?? [],
-          totalMatched: fallback.totalMatched ?? 0,
-          poolSize: fallback.poolSize ?? fallback.candidates?.length ?? 0,
-          date: fallback.source?.marketDate,
-        };
+        try {
+          data = { ...(await scanOfficialDirect(query.trim(), kind, strategy)), source: "OFFICIAL" };
+        } catch {
+          const canUseServerFallback = location.hostname.endsWith("chatgpt.site") || location.hostname === "terminal.local";
+          if (!canUseServerFallback) throw new Error("元大與證交所資料皆暫時無法取得，請稍後重試或使用手動匯入");
+          const response = await fetch(`/api/warrants?q=${encodeURIComponent(query.trim())}&kind=${kind}&strategy=${strategy}`);
+          const fallback = await response.json() as {
+            detail?: string; error?: string; candidates?: Warrant[]; totalMatched?: number; poolSize?: number;
+            source?: { marketDate?: string | null };
+          };
+          if (!response.ok) throw new Error(fallback.detail ?? fallback.error);
+          data = {
+            candidates: fallback.candidates ?? [],
+            totalMatched: fallback.totalMatched ?? 0,
+            poolSize: fallback.poolSize ?? fallback.candidates?.length ?? 0,
+            date: fallback.source?.marketDate,
+            source: "OFFICIAL",
+          };
+        }
       }
       if (!data.candidates?.length) {
         setSourceNote("官方資料暫時沒有可用候選，請使用手動匯入。");
@@ -299,11 +398,30 @@ export default function Home() {
         return;
       }
       const existing = new Map(rows.map((r) => [r.code, r]));
-      const merged = (data.candidates as Warrant[]).map((r) => ({ ...r, ...MANUAL_FIELDS
-        .reduce((acc, k) => ({ ...acc, [k]: existing.get(r.code)?.[k] ?? "" }), {}) }));
+      const merged = (data.candidates as Warrant[]).map((r) => {
+        const previous = existing.get(r.code);
+        const edited = new Set(previous?.userEditedFields ?? []);
+        const overrides = MANUAL_FIELDS.reduce<Partial<Record<ManualField, string>>>((acc, field) => {
+          const previousValue = previous?.[field];
+          const legacyManualValue = previous?.source !== "YUANTA" && previousValue !== "" && previousValue !== undefined;
+          if ((edited.has(String(field)) || legacyManualValue) && typeof previousValue === "string") acc[field] = previousValue;
+          return acc;
+        }, {});
+        return {
+          ...r,
+          ...overrides,
+          userEditedFields: previous?.userEditedFields ?? [],
+          deltaInputSource: edited.has("delta") || (previous?.source !== "YUANTA" && overrides.delta)
+            ? "manual" as const
+            : r.deltaInputSource,
+        };
+      });
       setRows(merged);
       setStockPrice(merged[0]?.underlyingPrice ?? null);
-      setSourceNote(`官方資料日 ${data.date ?? "未標示"}｜${STRATEGIES[strategy].label}｜符合 ${data.totalMatched} 檔 → 備選池 ${data.poolSize} 檔 → 最終 ${merged.length} 檔｜${new Date().toLocaleString("zh-TW")}`);
+      const sourceLabel = data.source === "YUANTA"
+        ? `元大全發行人快照（${data.issuerCount ?? "?"} 家券商）`
+        : "TWSE／TPEx 官方資料";
+      setSourceNote(`${sourceLabel}｜資料時間 ${data.date ?? "未標示"}｜${STRATEGIES[strategy].label}｜符合 ${data.totalMatched} 檔 → 備選池 ${data.poolSize} 檔 → 最終 ${merged.length} 檔`);
       setAnalyzed(false);
       toast.success(`已完成初篩，保留 ${merged.length} 檔候選`);
     } catch (error) {
@@ -318,7 +436,13 @@ export default function Home() {
   function update(code: string, field: keyof Warrant, value: string) {
     const marketField = ["bid", "ask", "bidQty", "askQty", "bidIv", "askIv", "spreadStd", "quoteStopCount", "depthDropCount"].includes(String(field));
     setRows((current) => current.map((r) => r.code === code
-      ? { ...r, [field]: value, ...(marketField ? { quoteAt: new Date().toISOString() } : {}) }
+      ? {
+        ...r,
+        [field]: value,
+        userEditedFields: [...new Set([...(r.userEditedFields ?? []), String(field)])],
+        ...(field === "delta" ? { deltaInputSource: "manual" as const } : {}),
+        ...(marketField ? { quoteAt: new Date().toISOString() } : {}),
+      }
       : r));
   }
 
@@ -341,6 +465,18 @@ export default function Home() {
       if (!code) return null;
       const expiry = at(row, [/到期/, /expiry/], 3) || null;
       const expiryMs = expiry ? new Date(expiry).getTime() : NaN;
+      const manualValues = {
+        iv: at(row, [/^iv/, /隱含波動/], -1),
+        delta: at(row, [/delta/], -1),
+        bid: at(row, [/^bid$/, /買一價/], -1),
+        ask: at(row, [/^ask$/, /賣一價/], -1),
+        bidQty: at(row, [/bidqty/, /買一量/, /買量/], -1),
+        askQty: at(row, [/askqty/, /賣一量/, /賣量/], -1),
+        outstandingRatio: at(row, [/流通比/, /outstanding/], -1),
+        volume: at(row, [/成交量/, /volume/], -1),
+        bidIv: at(row, [/買一iv/, /bidiv/], -1),
+        askIv: at(row, [/賣一iv/, /askiv/], -1),
+      };
       return {
         id: code, code,
         name: at(row, [/權證/, /name/], 1) || code,
@@ -352,16 +488,9 @@ export default function Home() {
         moneyness: n(at(row, [/價內外/, /moneyness/], 6)),
         score: 50,
         source: "MANUAL",
-        iv: at(row, [/^iv/, /隱含波動/], -1),
-        delta: at(row, [/delta/], -1),
-        bid: at(row, [/^bid$/, /買一價/], -1),
-        ask: at(row, [/^ask$/, /賣一價/], -1),
-        bidQty: at(row, [/bidqty/, /買一量/, /買量/], -1),
-        askQty: at(row, [/askqty/, /賣一量/, /賣量/], -1),
-        outstandingRatio: at(row, [/流通比/, /outstanding/], -1),
-        volume: at(row, [/成交量/, /volume/], -1),
-        bidIv: at(row, [/買一iv/, /bidiv/], -1),
-        askIv: at(row, [/賣一iv/, /askiv/], -1),
+        ...manualValues,
+        deltaInputSource: manualValues.delta ? "manual" : undefined,
+        userEditedFields: Object.entries(manualValues).filter(([, value]) => value !== "").map(([field]) => field),
       };
     }).filter((x): x is Warrant => !!x);
     if (!imported.length) return toast.error("無法辨識資料，請確認第一欄為權證代號");
@@ -550,7 +679,7 @@ export default function Home() {
           <div className="mt-4 flex flex-wrap items-end gap-3 rounded-lg border border-violet-400/15 bg-violet-400/[0.035] px-3 py-3">
             <div className="mr-1 min-w-[220px] flex-1">
               <div className="text-xs font-medium text-violet-300">Black–Scholes Delta 模型 <DataTag type="CALCULATED" /></div>
-              <div className="mt-1 text-[11px] leading-5 text-slate-500">未填三竹 Delta 時，輸入 IV 即自動估算；人工 Delta 永遠優先。模型值不冒充券商盤中數據。</div>
+              <div className="mt-1 text-[11px] leading-5 text-slate-500">優先採用元大快照 Delta；若該欄缺失，輸入 IV 即以模型估算。使用者手動修改後永遠優先。</div>
             </div>
             <label className="text-xs text-slate-400">無風險利率 %
               <Input aria-label="Delta 模型無風險利率" inputMode="decimal" value={riskFreeRatePct} onChange={(e) => { setRiskFreeRatePct(e.target.value); setAnalyzed(false); }} className="mt-1 h-9 w-28 border-violet-400/20 bg-[#07111f] font-mono" />
@@ -560,7 +689,7 @@ export default function Home() {
             </label>
           </div>
           <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-white/8 pt-4 text-xs text-slate-500">
-            <span className="flex items-center gap-1.5"><Database className="size-3.5" />自動來源：證交所 TWSE＋櫃買中心 TPEx 官方資料</span>
+            <span className="flex items-center gap-1.5"><Database className="size-3.5" />自動來源：元大權證搜尋（全發行人）＋TWSE／TPEx 備援</span>
             <span>模式：{STRATEGIES[strategy].label}｜目標標準化Δ {STRATEGIES[strategy].targetDelta[0]}～{STRATEGIES[strategy].targetDelta[1]}｜實質槓桿 {STRATEGIES[strategy].targetGearing[0]}～{STRATEGIES[strategy].targetGearing[1]}×</span>
             <span>初篩使用可計算的槓桿潛力；填入 IV 後自動估算 Delta 並重評</span>
             <span>標的價格：{stockPrice === null ? "目前無法可靠取得" : `${fmt(stockPrice)} 元`}</span>
@@ -613,7 +742,7 @@ export default function Home() {
               <div className="flex flex-col gap-3 border-b border-white/10 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
                 <div>
                   <h2 className="font-semibold">候選權證比較</h2>
-                  <p className="mt-1 text-xs text-slate-500">輸入 IV 即可自動估算 Delta；若另填三竹 Delta，系統會改用人工值。Bid / Ask 與掛單量可稍後補。</p>
+                  <p className="mt-1 text-xs text-slate-500">元大快照會自動帶入 Delta、IV、Bid / Ask 與掛單量；任何欄位仍可用三竹數值手動覆寫。</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <Button onClick={analyze} className="bg-emerald-400 text-[#062017] hover:bg-emerald-300"><Calculator />重新分析與排名</Button>
@@ -635,13 +764,13 @@ export default function Home() {
                     <TableHead className="text-slate-400">券商</TableHead>
                     <TableHead className="text-slate-400">天數／履約／價內外 <DataTag type="AUTO" /></TableHead>
                     <TableHead className="text-right text-slate-400">價格／比例</TableHead>
-                    <TableHead className="text-slate-400">Delta／實質槓桿 <DataTag type="CALCULATED" /></TableHead>
-                    <TableHead className="text-slate-400">流通比／成交量 <DataTag type="MANUAL" /></TableHead>
-                    <TableHead className="text-slate-400">Bid / Ask <DataTag type="MANUAL" /></TableHead>
+                    <TableHead className="text-slate-400">Delta／實質槓桿 <DataTag type={autoEnriched ? "YUANTA" : "MANUAL"} /></TableHead>
+                    <TableHead className="text-slate-400">流通比／成交量 <DataTag type={autoEnriched ? "YUANTA" : "MANUAL"} /></TableHead>
+                    <TableHead className="text-slate-400">Bid / Ask <DataTag type={autoEnriched ? "YUANTA" : "MANUAL"} /></TableHead>
                     <TableHead className="text-slate-400">買一／賣一量</TableHead>
                     <TableHead className="text-right text-slate-400">Spread %／Tick <DataTag type="CALCULATED" /></TableHead>
                     <TableHead className="text-right text-slate-400">買一掛單金額</TableHead>
-                    <TableHead className="text-slate-400">買一／賣一 IV <DataTag type="MANUAL" /></TableHead>
+                    <TableHead className="text-slate-400">買一／賣一 IV <DataTag type={autoEnriched ? "YUANTA" : "MANUAL"} /></TableHead>
                     <TableHead className="text-right text-slate-400">同群中位／異常值</TableHead>
                     <TableHead className="text-slate-400">造市品質</TableHead>
                     <TableHead className="text-right text-slate-400">綜合分數</TableHead>
@@ -661,7 +790,7 @@ export default function Home() {
                         <TableCell className="text-slate-300">{row.issuer ?? inferIssuer(row.name) ?? "待補"}</TableCell>
                         <TableCell><div className="font-mono">{row.days === null ? "待補" : `${row.days} 天`}</div><div className="text-xs text-slate-500">履約 {fmt(row.strike)}｜{row.moneyness === null ? "價內外待補" : `${row.moneyness > 0 ? "+" : ""}${fmt(row.moneyness, 1)}%`}</div></TableCell>
                         <TableCell className="text-right font-mono"><div>{fmt(warrantPrice(row), 2)} 元</div><div className="text-xs text-slate-500">比例 {fmt(row.ratio, 4)}</div><div className="text-[10px] text-slate-600">理論槓桿 {fmt(theoreticalGearing(row), 2)}×</div></TableCell>
-                        <TableCell><div className="flex items-center gap-1"><Input aria-label={`${row.code} 原始 Delta`} inputMode="decimal" value={row.delta ?? ""} onChange={(e) => update(row.code, "delta", e.target.value)} placeholder={item.deltaSource === "model" ? fmt(item.resolvedRawDelta, 5) : "原始 Δ"} className="h-9 w-20 border-amber-400/20 bg-amber-400/5 font-mono" />{item.deltaSource === "model" && <Badge variant="outline" className="border-violet-400/30 text-[9px] text-violet-300">MODEL</Badge>}{item.deltaSource === "manual" && <Badge variant="outline" className="border-amber-400/30 text-[9px] text-amber-300">MANUAL</Badge>}</div><div className="mt-1 text-xs font-mono text-violet-300">標準化 {fmt(item.normalizedDelta, 3)}｜{item.gearing === null ? "槓桿待補" : `${fmt(item.gearing, 2)}×`}</div></TableCell>
+                        <TableCell><div className="flex items-center gap-1"><Input aria-label={`${row.code} 原始 Delta`} inputMode="decimal" value={row.delta ?? ""} onChange={(e) => update(row.code, "delta", e.target.value)} placeholder={item.deltaSource === "model" ? fmt(item.resolvedRawDelta, 5) : "原始 Δ"} className="h-9 w-20 border-amber-400/20 bg-amber-400/5 font-mono" />{item.deltaSource === "yuanta" && <Badge variant="outline" className="border-emerald-400/30 text-[9px] text-emerald-300">YUANTA</Badge>}{item.deltaSource === "model" && <Badge variant="outline" className="border-violet-400/30 text-[9px] text-violet-300">MODEL</Badge>}{item.deltaSource === "manual" && <Badge variant="outline" className="border-amber-400/30 text-[9px] text-amber-300">MANUAL</Badge>}</div><div className="mt-1 text-xs font-mono text-violet-300">標準化 {fmt(item.normalizedDelta, 3)}｜{item.gearing === null ? "槓桿待補" : `${fmt(item.gearing, 2)}×`}</div></TableCell>
                         <TableCell><div className="flex gap-1"><Input aria-label={`${row.code} 在外流通比`} inputMode="decimal" value={row.outstandingRatio ?? ""} onChange={(e) => update(row.code, "outstandingRatio", e.target.value)} placeholder="流通 %" className="h-9 w-20 font-mono" /><Input aria-label={`${row.code} 成交量`} inputMode="numeric" value={row.volume ?? ""} onChange={(e) => update(row.code, "volume", e.target.value)} placeholder="成交張" className="h-9 w-20 font-mono" /></div></TableCell>
                         <TableCell><div className="flex gap-1"><Input aria-label={`${row.code} Bid`} inputMode="decimal" value={row.bid ?? ""} onChange={(e) => update(row.code, "bid", e.target.value)} placeholder="Bid" className="h-9 w-20 font-mono" /><Input aria-label={`${row.code} Ask`} inputMode="decimal" value={row.ask ?? ""} onChange={(e) => update(row.code, "ask", e.target.value)} placeholder="Ask" className="h-9 w-20 font-mono" /></div>{row.quoteAt && <div className="mt-1 text-[10px] text-slate-600">{new Date(row.quoteAt).toLocaleTimeString("zh-TW", { hour: "2-digit", minute: "2-digit" })}</div>}</TableCell>
                         <TableCell><div className="flex gap-1"><Input aria-label={`${row.code} Bid掛單量`} inputMode="numeric" value={row.bidQty ?? ""} onChange={(e) => update(row.code, "bidQty", e.target.value)} placeholder="買量" className="h-9 w-20 font-mono" /><Input aria-label={`${row.code} Ask掛單量`} inputMode="numeric" value={row.askQty ?? ""} onChange={(e) => update(row.code, "askQty", e.target.value)} placeholder="賣量" className="h-9 w-20 font-mono" /></div></TableCell>

@@ -39,6 +39,8 @@ next-env.d.ts
 /dist/
 /github-dist/
 /public/market-data.json
+/public/yuanta/
+/public/yuanta-next/
 *.tsbuildinfo
 /.wrangler/
 # Checkout-local execution profile and tool state; never publish them.
