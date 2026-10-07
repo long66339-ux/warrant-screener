@@ -37,6 +37,11 @@ export type Warrant = {
   depthDropCount?: string;
   upMoveBidIvDropCount?: string;
   quoteAt?: string;
+  deltaInputSource?: "yuanta" | "manual";
+  userEditedFields?: string[];
+  reportedGearing?: number | null;
+  dataFetchedAt?: string;
+  dataMarketTime?: string | null;
   modelRiskFreeRatePct?: number;
   modelDividendYieldPct?: number;
 };
@@ -60,7 +65,7 @@ export type ScoredWarrant = {
   ivAnomaly: number | null;
   normalizedDelta: number | null;
   resolvedRawDelta: number | null;
-  deltaSource: "manual" | "model" | null;
+  deltaSource: "yuanta" | "manual" | "model" | null;
   gearing: number | null;
   premium: number | null;
   market: ReturnType<typeof spread>;
@@ -179,7 +184,11 @@ export function deltaResolution(row: Warrant) {
   const delta = numberValue(row.delta);
   const ratio = numberValue(row.ratio);
   if (delta !== null && ratio !== null && ratio > 0) {
-    return { normalized: Math.abs(delta) / ratio, raw: delta, source: "manual" as const };
+    return {
+      normalized: Math.abs(delta) / ratio,
+      raw: delta,
+      source: row.deltaInputSource === "yuanta" ? "yuanta" as const : "manual" as const,
+    };
   }
   const estimated = estimatedNormalizedDelta(row);
   if (estimated === null || ratio === null || ratio <= 0) return { normalized: null, raw: null, source: null };
@@ -226,6 +235,11 @@ export function spread(row: Warrant) {
 }
 
 export function effectiveGearing(row: Warrant) {
+  const edited = new Set(row.userEditedFields ?? []);
+  if (row.reportedGearing !== null && row.reportedGearing !== undefined &&
+    !edited.has("delta") && !edited.has("bid") && !edited.has("ask")) {
+    return row.reportedGearing;
+  }
   const price = warrantPrice(row);
   const spot = row.underlyingPrice ?? null;
   const delta = deltaResolution(row).raw;
