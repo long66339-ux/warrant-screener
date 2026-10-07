@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  deltaResolution,
   earliestSelectionLevel,
+  estimatedNormalizedDelta,
   hardExclusionReasons,
   peerMedianIv,
   pickInitialCandidates,
@@ -63,6 +65,24 @@ test("缺少造市與 IV 資料會降低完整度，不會補成中性完整分�
   assert.equal(incomplete.complete, false);
 });
 
+test("輸入 IV 後可用 Black–Scholes 自動估算 Delta，人工值優先覆蓋", () => {
+  const modeled = warrant("MODEL", {
+    days: 365,
+    strike: 100,
+    underlyingPrice: 100,
+    ratio: 0.08,
+    iv: "20",
+    modelRiskFreeRatePct: 0,
+    modelDividendYieldPct: 0,
+  });
+  assert.ok(Math.abs((estimatedNormalizedDelta(modeled) ?? 0) - 0.5398) < 0.001);
+  assert.equal(deltaResolution(modeled).source, "model");
+  assert.ok(Math.abs((deltaResolution(modeled).raw ?? 0) - 0.04318) < 0.0001);
+  const manual = { ...modeled, delta: "0.032" };
+  assert.equal(deltaResolution(manual).source, "manual");
+  assert.equal(deltaResolution(manual).normalized, 0.4);
+});
+
 test("IV 異常值使用相近日數、Delta 與價內外權證的中位數", () => {
   const rows = [
     warrant("A", { delta: "0.04", iv: "60" }),
@@ -87,15 +107,28 @@ test("人工數據重評後仍保留初篩被選入的層級", () => {
     bidQty: "200",
     askQty: "200",
   });
-  assert.equal(earliestSelectionLevel(row), 4);
+  assert.equal(earliestSelectionLevel(row), 3);
   assert.equal(scoreRows([row], "balanced")[0].row.selectionLevel, 1);
 });
 
 test("交易模式會改變同層候選排序", () => {
   const rows = [
     warrant("LONG", { days: 330, moneyness: 5 }),
-    warrant("FAST", { days: 100, moneyness: -4 }),
+    warrant("FAST", { days: 100, moneyness: -4, lastPrice: 0.5 }),
   ];
   assert.equal(pickInitialCandidates(rows, "longTerm", 2).candidates[0].code, "LONG");
   assert.equal(pickInitialCandidates(rows, "aggressive", 2).candidates[0].code, "FAST");
+});
+
+test("積極型初篩使用理論槓桿與目標 Delta 推估實質槓桿潛力", () => {
+  const lowPotential = warrant("LOW", { lastPrice: 3.2, ratio: 0.005, underlyingPrice: 1755, moneyness: -3 });
+  const highPotential = warrant("HIGH", { lastPrice: 1, ratio: 0.01, underlyingPrice: 1755, moneyness: -8 });
+  const selected = pickInitialCandidates([lowPotential, highPotential], "aggressive", 2).candidates;
+  assert.equal(selected[0].code, "HIGH");
+  assert.equal(selected[0].selectionLevel, 1);
+});
+
+test("積極型實質槓桿未達 5 倍時會明確警告", () => {
+  const scored = scoreRows([warrant("LOW-GEAR", { delta: "0.024", bid: "1.99", ask: "2.01" })], "aggressive")[0];
+  assert.ok(scored.warnings.some((warning) => warning.includes("未達積極型 5 倍下限")));
 });

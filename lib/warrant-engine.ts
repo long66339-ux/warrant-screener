@@ -37,6 +37,8 @@ export type Warrant = {
   depthDropCount?: string;
   upMoveBidIvDropCount?: string;
   quoteAt?: string;
+  modelRiskFreeRatePct?: number;
+  modelDividendYieldPct?: number;
 };
 
 export type ComponentScore = { value: number; weight: number; available: boolean; note: string };
@@ -57,6 +59,8 @@ export type ScoredWarrant = {
   peerMedianIv: number | null;
   ivAnomaly: number | null;
   normalizedDelta: number | null;
+  resolvedRawDelta: number | null;
+  deltaSource: "manual" | "model" | null;
   gearing: number | null;
   premium: number | null;
   market: ReturnType<typeof spread>;
@@ -65,6 +69,7 @@ export type ScoredWarrant = {
 
 export const FINAL_CANDIDATE_SIZE = 8;
 export const INITIAL_POOL_SIZE = 20;
+export const DEFAULT_DELTA_MODEL = { riskFreeRatePct: 1.5, dividendYieldPct: 0 } as const;
 
 // All model weights live here. Strategy multipliers alter emphasis, then the
 // engine normalizes the result back to 100 points.
@@ -147,10 +152,46 @@ export function median(values: number[]) {
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
-export function normalizedDelta(row: Warrant) {
+function normalCdf(value: number) {
+  const sign = value < 0 ? -1 : 1;
+  const x = Math.abs(value) / Math.sqrt(2);
+  const t = 1 / (1 + 0.3275911 * x);
+  const erf = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return 0.5 * (1 + sign * erf);
+}
+
+export function estimatedNormalizedDelta(row: Warrant) {
+  const spot = row.underlyingPrice ?? null;
+  const strike = row.strike ?? null;
+  const days = row.days ?? null;
+  const iv = representativeIv(row);
+  if (spot === null || spot <= 0 || strike === null || strike <= 0 || days === null || days <= 0 || iv === null || iv <= 0) return null;
+  const years = days / 365;
+  const sigma = iv / 100;
+  const riskFreeRate = (row.modelRiskFreeRatePct ?? DEFAULT_DELTA_MODEL.riskFreeRatePct) / 100;
+  const dividendYield = (row.modelDividendYieldPct ?? DEFAULT_DELTA_MODEL.dividendYieldPct) / 100;
+  const d1 = (Math.log(spot / strike) + (riskFreeRate - dividendYield + sigma * sigma / 2) * years) / (sigma * Math.sqrt(years));
+  const discount = Math.exp(-dividendYield * years);
+  return row.kind === "put" ? discount * normalCdf(-d1) : discount * normalCdf(d1);
+}
+
+export function deltaResolution(row: Warrant) {
   const delta = numberValue(row.delta);
   const ratio = numberValue(row.ratio);
-  return delta !== null && ratio !== null && ratio > 0 ? Math.abs(delta) / ratio : null;
+  if (delta !== null && ratio !== null && ratio > 0) {
+    return { normalized: Math.abs(delta) / ratio, raw: delta, source: "manual" as const };
+  }
+  const estimated = estimatedNormalizedDelta(row);
+  if (estimated === null || ratio === null || ratio <= 0) return { normalized: null, raw: null, source: null };
+  return {
+    normalized: estimated,
+    raw: estimated * ratio * (row.kind === "put" ? -1 : 1),
+    source: "model" as const,
+  };
+}
+
+export function normalizedDelta(row: Warrant) {
+  return deltaResolution(row).normalized;
 }
 
 export function warrantPrice(row: Warrant) {
@@ -187,10 +228,34 @@ export function spread(row: Warrant) {
 export function effectiveGearing(row: Warrant) {
   const price = warrantPrice(row);
   const spot = row.underlyingPrice ?? null;
-  const delta = numberValue(row.delta);
+  const delta = deltaResolution(row).raw;
   return price !== null && price > 0 && spot !== null && spot > 0 && delta !== null
     ? (spot / price) * Math.abs(delta)
     : null;
+}
+
+export function theoreticalGearing(row: Warrant) {
+  const price = warrantPrice(row);
+  const spot = row.underlyingPrice ?? null;
+  const ratio = numberValue(row.ratio);
+  return price !== null && price > 0 && spot !== null && spot > 0 && ratio !== null && ratio > 0
+    ? (spot * ratio) / price
+    : null;
+}
+
+export function potentialEffectiveGearingRange(row: Warrant, strategy: Strategy): [number, number] | null {
+  const gearing = theoreticalGearing(row);
+  if (gearing === null) return null;
+  const targetDelta = STRATEGIES[strategy].targetDelta;
+  return [gearing * targetDelta[0], gearing * targetDelta[1]];
+}
+
+function representativePotentialGearing(row: Warrant, strategy: Strategy) {
+  const range = potentialEffectiveGearingRange(row, strategy);
+  if (!range) return null;
+  const target = STRATEGIES[strategy].targetGearing;
+  const targetMid = (target[0] + target[1]) / 2;
+  return clamp(targetMid, range[0], range[1]);
 }
 
 export function premiumRate(row: Warrant) {
@@ -267,18 +332,36 @@ function passesIfKnown(value: number | null, predicate: (value: number) => boole
   return value === null || predicate(value);
 }
 
-export function earliestSelectionLevel(row: Warrant): 1 | 2 | 3 | 4 | null {
+function strategyMoneyRange(strategy: Strategy, level: 1 | 2 | 3 | 4, fallback: [number, number]): [number, number] {
+  if (strategy === "aggressive") return level === 1 ? [-15, 5] : level === 2 ? [-20, 10] : level === 3 ? [-25, 15] : [-30, 30];
+  if (strategy === "stockLike") return level === 1 ? [0, 15] : level === 2 ? [-5, 20] : level === 3 ? [-10, 25] : [-30, 30];
+  return fallback;
+}
+
+function expandedTarget(target: [number, number], level: 1 | 2 | 3 | 4, delta: number): [number, number] {
+  const expansion = level === 1 ? 0 : level === 2 ? delta : level === 3 ? delta * 2 : delta * 4;
+  return [Math.max(0, target[0] - expansion), target[1] + expansion];
+}
+
+export function earliestSelectionLevel(row: Warrant, strategy: Strategy = "balanced"): 1 | 2 | 3 | 4 | null {
   if (hardExclusionReasons(row).length) return null;
   const delta = normalizedDelta(row);
   const gearing = effectiveGearing(row);
+  const theoretical = theoreticalGearing(row);
+  const config = STRATEGIES[strategy];
+  if (strategy === "aggressive" && gearing === null && theoretical === null) return 4;
+  const potentialGearing = gearing ?? (strategy === "aggressive" ? representativePotentialGearing(row, strategy) : null);
   const quote = spread(row);
   const outstanding = numberValue(row.outstandingRatio);
   const price = warrantPrice(row);
   for (const rule of LEVEL_RULES) {
+    const moneyRange = strategyMoneyRange(strategy, rule.level, rule.money);
+    const deltaRange = expandedTarget(config.targetDelta, rule.level, 0.08);
+    const gearingRange = expandedTarget(config.targetGearing, rule.level, 1);
     const passes = passesIfKnown(row.days, (value) => value >= rule.minDays)
-      && passesIfKnown(row.moneyness, (value) => value >= rule.money[0] && value <= rule.money[1])
-      && passesIfKnown(delta, (value) => value >= rule.delta[0] && value <= rule.delta[1])
-      && passesIfKnown(gearing, (value) => value >= rule.gearing[0] && value <= rule.gearing[1])
+      && passesIfKnown(row.moneyness, (value) => value >= moneyRange[0] && value <= moneyRange[1])
+      && passesIfKnown(delta, (value) => value >= deltaRange[0] && value <= deltaRange[1])
+      && passesIfKnown(potentialGearing, (value) => value >= gearingRange[0] && value <= gearingRange[1])
       && passesIfKnown(quote.percent, (value) => value <= rule.maxSpread)
       && passesIfKnown(quote.ticks, (value) => value <= rule.maxTicks + 0.05)
       && passesIfKnown(outstanding, (value) => value < rule.maxOutstanding)
@@ -297,10 +380,15 @@ function initialStrategyScore(row: Warrant, strategy: Strategy) {
   const ratioScore = clamp((row.ratio ?? 0) / 0.05);
   const price = warrantPrice(row);
   const priceScore = price === null ? 0.45 : price < 0.5 ? 0 : price < 1 ? 0.45 : price <= 5 ? 1 : 0.8;
+  const config = STRATEGIES[strategy];
+  const potentialEffectiveGearing = representativePotentialGearing(row, strategy);
+  const potentialScore = potentialEffectiveGearing === null
+    ? strategy === "aggressive" ? 0 : 0.35
+    : rangeScore(potentialEffectiveGearing, ...config.targetGearing, 0.5, 14);
   const base = strategy === "longTerm"
     ? dayScore * 0.62 + moneyScore * 0.2 + ratioScore * 0.1 + priceScore * 0.08
     : strategy === "aggressive"
-      ? dayScore * 0.18 + moneyScore * 0.52 + ratioScore * 0.18 + priceScore * 0.12
+      ? dayScore * 0.08 + moneyScore * 0.22 + ratioScore * 0.05 + priceScore * 0.05 + potentialScore * 0.6
       : strategy === "stockLike"
         ? dayScore * 0.3 + moneyScore * 0.5 + ratioScore * 0.12 + priceScore * 0.08
         : strategy === "lowCost"
@@ -312,7 +400,7 @@ function initialStrategyScore(row: Warrant, strategy: Strategy) {
 export function pickInitialCandidates(rows: Warrant[], strategy: Strategy, target = FINAL_CANDIDATE_SIZE) {
   const eligible = rows
     .filter((row) => !hardExclusionReasons(row).length)
-    .map((row) => ({ ...row, score: initialStrategyScore(row, strategy), selectionLevel: earliestSelectionLevel(row) ?? 4 }));
+    .map((row) => ({ ...row, score: initialStrategyScore(row, strategy), selectionLevel: earliestSelectionLevel(row, strategy) ?? 4 }));
   const pool = [...eligible]
     .sort((a, b) => a.selectionLevel! - b.selectionLevel! || b.score - a.score || (b.days ?? 0) - (a.days ?? 0))
     .slice(0, INITIAL_POOL_SIZE);
@@ -384,7 +472,7 @@ function scoreIvQuality(row: Warrant, rows: Warrant[]) {
   return { score: sub.reduce((sum, item) => sum + item.score * item.weight, 0) / usedWeight, coverage: usedWeight / 100, peer, anomaly };
 }
 
-function riskWarnings(row: Warrant, ivAnomaly: number | null) {
+function riskWarnings(row: Warrant, ivAnomaly: number | null, strategy: Strategy) {
   const warnings: string[] = [];
   const gearing = effectiveGearing(row);
   const quote = spread(row);
@@ -397,7 +485,8 @@ function riskWarnings(row: Warrant, ivAnomaly: number | null) {
   if (row.days !== null && row.days >= 45 && row.days < 60) warnings.push(`剩餘 ${row.days} 天，時間耗損風險偏高`);
   if (outstanding !== null && outstanding >= 60 && outstanding < 80) warnings.push(`在外流通比 ${outstanding.toFixed(1)}%，接近高風險區`);
   if (quote.percent !== null && quote.percent > 3.5) warnings.push(`Spread ${quote.percent.toFixed(1)}%，交易摩擦偏高`);
-  if (delta !== null && delta < 0.35) warnings.push(`標準化 Delta ${delta.toFixed(2)}，標的敏感度偏低`);
+  if (delta !== null && delta < STRATEGIES[strategy].targetDelta[0]) warnings.push(`標準化 Delta ${delta.toFixed(2)}，低於${STRATEGIES[strategy].label}目標`);
+  if (strategy === "aggressive" && gearing !== null && gearing < STRATEGIES.aggressive.targetGearing[0]) warnings.push(`實質槓桿 ${gearing.toFixed(1)} 倍，未達積極型 5 倍下限`);
   if (ivAnomaly !== null && ivAnomaly > 6) warnings.push(`IV 高於相似權證中位數 ${ivAnomaly.toFixed(1)} 個百分點`);
   if (price !== null && price >= 0.5 && price < 1) warnings.push(`權證價格 ${price.toFixed(2)} 元，低價跳動風險較高`);
   if (volume !== null && volume < 50 && (amount === null || amount < 100_000)) warnings.push("成交量與買一深度皆偏低");
@@ -415,7 +504,8 @@ export function scoreRows(rows: Warrant[], strategy: Strategy): ScoredWarrant[] 
   return rows.map((row) => {
     const mm = scoreMarketMaking(row);
     const ivQuality = scoreIvQuality(row, rows);
-    const delta = normalizedDelta(row);
+    const resolvedDelta = deltaResolution(row);
+    const delta = resolvedDelta.normalized;
     const gearing = effectiveGearing(row);
     const outstanding = numberValue(row.outstandingRatio);
     const volume = numberValue(row.volume);
@@ -468,13 +558,13 @@ export function scoreRows(rows: Warrant[], strategy: Strategy): ScoredWarrant[] 
       // Keep the level at which the warrant entered the initial candidate set.
       // Manual metrics may change its score and warnings, but must not rewrite
       // the historical selection-level label shown to the user.
-      row: { ...row, selectionLevel: row.selectionLevel ?? earliestSelectionLevel(row) ?? 4 },
+      row: { ...row, selectionLevel: row.selectionLevel ?? earliestSelectionLevel(row, strategy) ?? 4 },
       final,
       rawScore,
       completeness,
       complete: representativeIv(row) !== null && delta !== null && mm.score !== null && outstanding !== null,
       excludedReasons,
-      warnings: riskWarnings(row, ivQuality.anomaly),
+      warnings: riskWarnings(row, ivQuality.anomaly, strategy),
       breakdown,
       marketScore: mm.score === null ? null : mm.score * 100,
       marketGrade,
@@ -482,6 +572,8 @@ export function scoreRows(rows: Warrant[], strategy: Strategy): ScoredWarrant[] 
       peerMedianIv: ivQuality.peer,
       ivAnomaly: ivQuality.anomaly,
       normalizedDelta: delta,
+      resolvedRawDelta: resolvedDelta.raw,
+      deltaSource: resolvedDelta.source,
       gearing,
       premium: premiumRate(row),
       market: quote,
@@ -493,13 +585,15 @@ export function scoreRows(rows: Warrant[], strategy: Strategy): ScoredWarrant[] 
   });
 }
 
-export function rationale(item: ScoredWarrant) {
+export function rationale(item: ScoredWarrant, strategy: Strategy = "balanced") {
   const advantages: string[] = [];
   const risks = [...item.excludedReasons, ...item.warnings];
   const { row } = item;
   if ((row.days ?? 0) >= 90) advantages.push(`剩餘 ${row.days} 天，時間容錯充足`);
-  if (item.normalizedDelta !== null && item.normalizedDelta >= 0.35 && item.normalizedDelta <= 0.65) advantages.push(`標準化 Delta ${item.normalizedDelta.toFixed(2)}，敏感度位於理想區間`);
-  if (item.gearing !== null && item.gearing >= 3 && item.gearing <= 5) advantages.push(`實質槓桿 ${item.gearing.toFixed(1)} 倍，兼顧反應與風險`);
+  const deltaTarget = STRATEGIES[strategy].targetDelta;
+  const gearingTarget = STRATEGIES[strategy].targetGearing;
+  if (item.normalizedDelta !== null && item.normalizedDelta >= deltaTarget[0] && item.normalizedDelta <= deltaTarget[1]) advantages.push(`標準化 Delta ${item.normalizedDelta.toFixed(2)}，符合${STRATEGIES[strategy].label}目標`);
+  if (item.gearing !== null && item.gearing >= gearingTarget[0] && item.gearing <= gearingTarget[1]) advantages.push(`實質槓桿 ${item.gearing.toFixed(1)} 倍，符合${STRATEGIES[strategy].label}目標`);
   if (item.market.percent !== null && item.market.percent <= 2) advantages.push(`Spread ${item.market.percent.toFixed(1)}%，交易摩擦低`);
   if (item.bidAmount !== null && item.bidAmount >= 200_000) advantages.push(`買一掛單金額約 ${(item.bidAmount / 10_000).toFixed(0)} 萬元，承接深度充足`);
   if (item.ivAnomaly !== null && item.ivAnomaly <= 0) advantages.push(`IV 低於相似權證中位數 ${Math.abs(item.ivAnomaly).toFixed(1)} 個百分點`);
