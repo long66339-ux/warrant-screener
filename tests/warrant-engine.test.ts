@@ -132,3 +132,19 @@ test("積極型實質槓桿未達 5 倍時會明確警告", () => {
   const scored = scoreRows([warrant("LOW-GEAR", { delta: "0.024", bid: "1.99", ask: "2.01" })], "aggressive")[0];
   assert.ok(scored.warnings.some((warning) => warning.includes("未達積極型 5 倍下限")));
 });
+
+test("初選50檔後會用同標的相對 IV、Delta 與造市品質縮成20檔", () => {
+  const rows = Array.from({ length: 25 }, (_, index) => warrant(`W${index}`, {
+    delta: "0.04",
+    iv: index === 0 ? "100" : String(39 + index % 3),
+    bid: "1.99",
+    ask: "2.01",
+    bidQty: "200",
+    askQty: "200",
+  }));
+  const selection = pickInitialCandidates(rows, "balanced", 20);
+  assert.equal(selection.preselectionPoolSize, 25);
+  assert.equal(selection.poolSize, 20);
+  assert.equal(selection.candidates.length, 20);
+  assert.ok(!selection.candidates.some((row) => row.code === "W0"));
+});

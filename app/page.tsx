@@ -164,6 +164,7 @@ async function scanOfficialDirect(input: string, kind: "call" | "put", strategy:
   try {
     const response = await fetch("https://www.twse.com.tw/rwd/zh/stock/warrantStock?response=json", {
       headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(8_000),
     });
     if (!response.ok) throw new Error(`TWSE ${response.status}`);
     payload = await response.json() as typeof payload;
@@ -214,8 +215,8 @@ async function scanOfficialDirect(input: string, kind: "call" | "put", strategy:
     quotes = local.tpexQuotes;
   } catch {
     const [issueResponse, quoteResponse] = await Promise.all([
-      fetch("https://www.tpex.org.tw/openapi/v1/tpex_warrant_issue", { headers: { accept: "application/json" } }),
-      fetch("https://www.tpex.org.tw/openapi/v1/tpex_warrant_daily_quts", { headers: { accept: "application/json" } }),
+      fetch("https://www.tpex.org.tw/openapi/v1/tpex_warrant_issue", { headers: { accept: "application/json" }, signal: AbortSignal.timeout(8_000) }),
+      fetch("https://www.tpex.org.tw/openapi/v1/tpex_warrant_daily_quts", { headers: { accept: "application/json" }, signal: AbortSignal.timeout(8_000) }),
     ]);
     if (!issueResponse.ok || !quoteResponse.ok) throw new Error("TPEx response error");
     issues = await issueResponse.json() as Record<string, unknown>[];
@@ -363,9 +364,15 @@ export default function Home() {
     if (!query.trim()) return toast.error("請先輸入股票名稱或代號");
     setLoading(true);
     setSourceNote("");
+    // Never leave the previous underlying visible while a new scan is running
+    // or after all sources fail. The closed-over `rows` value is still used
+    // below to preserve manual overrides when the same warrant is found again.
+    setRows([]);
+    setStockPrice(null);
+    setAnalyzed(false);
     try {
       let data: {
-        candidates: Warrant[]; totalMatched: number; poolSize: number; date?: string | null;
+        candidates: Warrant[]; totalMatched: number; preselectionPoolSize?: number; poolSize: number; date?: string | null;
         source?: "YUANTA" | "OFFICIAL"; issuerCount?: number;
         coverage?: { rows: number; issuers: number; delta: number; bidIv: number; askIv: number };
       };
@@ -379,13 +386,14 @@ export default function Home() {
           if (!canUseServerFallback) throw new Error("元大與證交所資料皆暫時無法取得，請稍後重試或使用手動匯入");
           const response = await fetch(`/api/warrants?q=${encodeURIComponent(query.trim())}&kind=${kind}&strategy=${strategy}`);
           const fallback = await response.json() as {
-            detail?: string; error?: string; candidates?: Warrant[]; totalMatched?: number; poolSize?: number;
+            detail?: string; error?: string; candidates?: Warrant[]; totalMatched?: number; preselectionPoolSize?: number; poolSize?: number;
             source?: { marketDate?: string | null };
           };
           if (!response.ok) throw new Error(fallback.detail ?? fallback.error);
           data = {
             candidates: fallback.candidates ?? [],
             totalMatched: fallback.totalMatched ?? 0,
+            preselectionPoolSize: fallback.preselectionPoolSize,
             poolSize: fallback.poolSize ?? fallback.candidates?.length ?? 0,
             date: fallback.source?.marketDate,
             source: "OFFICIAL",
@@ -421,7 +429,8 @@ export default function Home() {
       const sourceLabel = data.source === "YUANTA"
         ? `元大全發行人快照（${data.issuerCount ?? "?"} 家券商）`
         : "TWSE／TPEx 官方資料";
-      setSourceNote(`${sourceLabel}｜資料時間 ${data.date ?? "未標示"}｜${STRATEGIES[strategy].label}｜符合 ${data.totalMatched} 檔 → 備選池 ${data.poolSize} 檔 → 最終 ${merged.length} 檔`);
+      const preselection = data.preselectionPoolSize ?? data.poolSize;
+      setSourceNote(`${sourceLabel}｜資料時間 ${data.date ?? "未標示"}｜${STRATEGIES[strategy].label}｜符合 ${data.totalMatched} 檔 → 初選池 ${preselection} 檔 → 品質池 ${data.poolSize} 檔 → 最終 ${merged.length} 檔`);
       setAnalyzed(false);
       toast.success(`已完成初篩，保留 ${merged.length} 檔候選`);
     } catch (error) {
