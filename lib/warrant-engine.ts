@@ -73,6 +73,7 @@ export type ScoredWarrant = {
 };
 
 export const FINAL_CANDIDATE_SIZE = 8;
+export const PRESELECTION_POOL_SIZE = 50;
 export const INITIAL_POOL_SIZE = 20;
 export const DEFAULT_DELTA_MODEL = { riskFreeRatePct: 1.5, dividendYieldPct: 0 } as const;
 
@@ -411,11 +412,47 @@ function initialStrategyScore(row: Warrant, strategy: Strategy) {
   return Math.round(base * 100);
 }
 
+// The first pass intentionally stays structural: it prevents a very cheap IV
+// quote from rescuing a warrant with poor maturity, moneyness or price.  The
+// second pass then compares only plausible warrants on a like-for-like basis.
+// Raw IV is never compared across different underlyings; callers pass rows for
+// one underlying and peerMedianIv further restricts peers by maturity, Delta
+// and moneyness.
+function initialQualityScore(row: Warrant, peers: Warrant[], strategy: Strategy) {
+  const structural = initialStrategyScore(row, strategy) / 100;
+  const delta = normalizedDelta(row);
+  const deltaScore = delta === null ? null : rangeScore(delta, ...STRATEGIES[strategy].targetDelta, 0.1, 0.95);
+  const iv = representativeIv(row);
+  const peerIv = peerMedianIv(row, peers);
+  const ivAnomaly = iv !== null && peerIv !== null ? iv - peerIv : null;
+  const ivScore = ivAnomaly === null
+    ? null
+    : ivAnomaly <= 0 ? 1 : ivAnomaly <= 3 ? 0.85 : ivAnomaly <= 6 ? 0.65 : ivAnomaly <= 10 ? 0.35 : 0.1;
+  const marketMaking = scoreMarketMaking(row);
+  const components = [
+    { value: structural, weight: 35, coverage: 1 },
+    { value: deltaScore, weight: 20, coverage: deltaScore === null ? 0 : 1 },
+    { value: ivScore, weight: 25, coverage: ivScore === null ? 0 : 1 },
+    { value: marketMaking.score, weight: 20, coverage: marketMaking.score === null ? 0 : marketMaking.coverage },
+  ];
+  const available = components.filter((component): component is { value: number; weight: number; coverage: number } => component.value !== null);
+  const availableWeight = available.reduce((sum, component) => sum + component.weight, 0);
+  const raw = availableWeight
+    ? available.reduce((sum, component) => sum + component.value * component.weight, 0) / availableWeight
+    : structural;
+  const coverage = components.reduce((sum, component) => sum + component.coverage * component.weight, 0) / 100;
+  return Math.round(raw * (0.7 + 0.3 * coverage) * 100);
+}
+
 export function pickInitialCandidates(rows: Warrant[], strategy: Strategy, target = FINAL_CANDIDATE_SIZE) {
   const eligible = rows
     .filter((row) => !hardExclusionReasons(row).length)
     .map((row) => ({ ...row, score: initialStrategyScore(row, strategy), selectionLevel: earliestSelectionLevel(row, strategy) ?? 4 }));
-  const pool = [...eligible]
+  const preselectionPool = [...eligible]
+    .sort((a, b) => a.selectionLevel! - b.selectionLevel! || b.score - a.score || (b.days ?? 0) - (a.days ?? 0))
+    .slice(0, PRESELECTION_POOL_SIZE);
+  const pool = preselectionPool
+    .map((row) => ({ ...row, score: initialQualityScore(row, eligible, strategy) }))
     .sort((a, b) => a.selectionLevel! - b.selectionLevel! || b.score - a.score || (b.days ?? 0) - (a.days ?? 0))
     .slice(0, INITIAL_POOL_SIZE);
   const selected: Warrant[] = [];
@@ -427,7 +464,12 @@ export function pickInitialCandidates(rows: Warrant[], strategy: Strategy, targe
     }
     if (selected.length >= target) break;
   }
-  return { poolSize: pool.length, candidates: selected, excludedCount: rows.length - eligible.length };
+  return {
+    preselectionPoolSize: preselectionPool.length,
+    poolSize: pool.length,
+    candidates: selected,
+    excludedCount: rows.length - eligible.length,
+  };
 }
 
 function scoreMarketMaking(row: Warrant) {

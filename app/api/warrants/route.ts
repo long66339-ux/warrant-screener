@@ -211,6 +211,7 @@ export async function GET(request: NextRequest) {
       .filter(Boolean);
     return NextResponse.json({
       candidates: selection.candidates,
+      preselectionPoolSize: selection.preselectionPoolSize,
       poolSize: selection.poolSize,
       totalMatched: normalized.length,
       stock: stock ?? { code: /^\d{4}$/.test(input) ? input : null, name: /^\d{4}$/.test(input) ? null : input, price: null },
