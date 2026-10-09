@@ -268,6 +268,23 @@ export function potentialEffectiveGearingRange(row: Warrant, strategy: Strategy)
   return [gearing * targetDelta[0], gearing * targetDelta[1]];
 }
 
+export function aggressiveGearingStatus(rows: Warrant[]) {
+  const target = STRATEGIES.aggressive.targetGearing;
+  const actual = rows.map(effectiveGearing).filter((value): value is number => value !== null);
+  const potential = rows
+    .map((row) => potentialEffectiveGearingRange(row, "aggressive"))
+    .filter((range): range is [number, number] => range !== null);
+  return {
+    basis: actual.length ? "actual" as const : "potential" as const,
+    actualMin: actual.length ? Math.min(...actual) : null,
+    actualMax: actual.length ? Math.max(...actual) : null,
+    potentialMax: potential.length ? Math.max(...potential.map((range) => range[1])) : null,
+    reachesTarget: actual.length
+      ? actual.some((value) => value >= target[0] && value <= target[1])
+      : potential.some((range) => range[1] >= target[0] && range[0] <= target[1]),
+  };
+}
+
 function representativePotentialGearing(row: Warrant, strategy: Strategy) {
   const range = potentialEffectiveGearingRange(row, strategy);
   if (!range) return null;
@@ -430,13 +447,18 @@ function initialQualityScore(row: Warrant, peers: Warrant[], strategy: Strategy)
   const ivAnomaly = iv !== null && peerIv !== null ? iv - peerIv : null;
   const ivScore = ivAnomaly === null
     ? null
-    : ivAnomaly <= 0 ? 1 : ivAnomaly <= 3 ? 0.85 : ivAnomaly <= 6 ? 0.65 : ivAnomaly <= 10 ? 0.35 : 0.1;
+    : strategy === "lowCost"
+      ? ivAnomaly <= -6 ? 1 : ivAnomaly <= -3 ? 0.92 : ivAnomaly <= 0 ? 0.84 : ivAnomaly <= 3 ? 0.68 : ivAnomaly <= 6 ? 0.45 : ivAnomaly <= 10 ? 0.2 : 0.05
+      : ivAnomaly <= 0 ? 1 : ivAnomaly <= 3 ? 0.85 : ivAnomaly <= 6 ? 0.65 : ivAnomaly <= 10 ? 0.35 : 0.1;
   const marketMaking = scoreMarketMaking(row);
+  const weights = strategy === "lowCost"
+    ? { structural: 25, delta: 15, iv: 45, marketMaking: 15 }
+    : { structural: 35, delta: 20, iv: 25, marketMaking: 20 };
   const components = [
-    { value: structural, weight: 35, coverage: 1 },
-    { value: deltaScore, weight: 20, coverage: deltaScore === null ? 0 : 1 },
-    { value: ivScore, weight: 25, coverage: ivScore === null ? 0 : 1 },
-    { value: marketMaking.score, weight: 20, coverage: marketMaking.score === null ? 0 : marketMaking.coverage },
+    { value: structural, weight: weights.structural, coverage: 1 },
+    { value: deltaScore, weight: weights.delta, coverage: deltaScore === null ? 0 : 1 },
+    { value: ivScore, weight: weights.iv, coverage: ivScore === null ? 0 : 1 },
+    { value: marketMaking.score, weight: weights.marketMaking, coverage: marketMaking.score === null ? 0 : marketMaking.coverage },
   ];
   const available = components.filter((component): component is { value: number; weight: number; coverage: number } => component.value !== null);
   const availableWeight = available.reduce((sum, component) => sum + component.weight, 0);

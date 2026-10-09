@@ -22,7 +22,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   COMPONENT_LABELS, DEFAULT_DELTA_MODEL, STRATEGIES, deltaResolution, effectiveGearing,
-  numberValue as n, pickInitialCandidates, potentialEffectiveGearingRange, rationale, representativeIv, scoreRows, theoreticalGearing,
+  aggressiveGearingStatus, numberValue as n, pickInitialCandidates, rationale, representativeIv, scoreRows, theoreticalGearing,
   warrantPrice, warrantPriceResolution, type Strategy, type Warrant,
 } from "@/lib/warrant-engine";
 
@@ -49,6 +49,8 @@ const fmt = (value: number | null | undefined, digits = 2) =>
   value === null || value === undefined || !Number.isFinite(value)
     ? "待補"
     : value.toLocaleString("zh-TW", { maximumFractionDigits: digits });
+const fmtWarrantPrice = (value: number, source: "mid" | "last") =>
+  fmt(value, source === "mid" && Math.abs(value * 100 - Math.round(value * 100)) > 1e-8 ? 3 : 2);
 const ISSUERS = ["元大", "凱基", "群益", "永豐", "統一", "國泰", "國票", "中信", "富邦", "元富", "兆豐", "華南", "第一金", "台新", "康和", "玉山", "聯邦", "合庫", "中國信託"];
 const inferIssuer = (name: string) => ISSUERS.find((issuer) => name.includes(issuer)) ?? null;
 
@@ -349,15 +351,9 @@ export default function Home() {
     ].filter((x) => x.code);
   }, [modelRows, ranked]);
 
-  const aggressivePotential = useMemo(() => {
+  const aggressiveStatus = useMemo(() => {
     if (strategy !== "aggressive" || !modelRows.length) return null;
-    const ranges = modelRows.map((row) => potentialEffectiveGearingRange(row, strategy)).filter((range): range is [number, number] => !!range);
-    if (!ranges.length) return { max: null, reachesTarget: false };
-    const target = STRATEGIES.aggressive.targetGearing;
-    return {
-      max: Math.max(...ranges.map((range) => range[1])),
-      reachesTarget: ranges.some((range) => range[1] >= target[0] && range[0] <= target[1]),
-    };
+    return aggressiveGearingStatus(modelRows);
   }, [modelRows, strategy]);
 
   async function scan() {
@@ -732,10 +728,12 @@ export default function Home() {
                 [4, "備選", "未觸發硬性排除，但需重點檢查風險"],
               ].map(([level, title, description]) => <div key={level} className="rounded-lg border border-white/10 bg-[#091525] p-3"><div className="flex items-center gap-2"><LevelBadge level={level as 1 | 2 | 3 | 4} /><span className="text-sm font-medium text-slate-300">{title}</span></div><p className="mt-2 text-xs leading-5 text-slate-500">{description}</p></div>)}
             </section>
-            {aggressivePotential && !aggressivePotential.reachesTarget && (
+            {aggressiveStatus && !aggressiveStatus.reachesTarget && (
               <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.06] px-4 py-3 text-sm text-amber-200">
                 <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-                <span>目前候選即使採目標 Delta 上緣推估，最高潛在實質槓桿仍只有 {aggressivePotential.max === null ? "待補" : `${fmt(aggressivePotential.max, 2)}×`}，未達積極型 5～7× 標準；以下只列備選，不會宣稱已達標。</span>
+                {aggressiveStatus.basis === "actual"
+                  ? <span>目前候選已有 Delta；實際實質槓桿為 {aggressiveStatus.actualMin === null ? "待補" : `${fmt(aggressiveStatus.actualMin, 2)}×`}～{aggressiveStatus.actualMax === null ? "待補" : `${fmt(aggressiveStatus.actualMax, 2)}×`}，未達積極型 5～7× 目標。理論槓桿與目標 Delta 推估的最高潛力為 {aggressiveStatus.potentialMax === null ? "待補" : `${fmt(aggressiveStatus.potentialMax, 2)}×`}；以下是現有候選中相對積極者，不會宣稱已達標。</span>
+                  : <span>目前候選尚無可用 Delta；即使採目標 Delta 上緣推估，最高潛在實質槓桿仍只有 {aggressiveStatus.potentialMax === null ? "待補" : `${fmt(aggressiveStatus.potentialMax, 2)}×`}，未達積極型 5～7× 目標；以下只列備選，不會宣稱已達標。</span>}
               </div>
             )}
             <section className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -771,7 +769,7 @@ export default function Home() {
                     <TableHead className="w-14 text-slate-400">排名</TableHead>
                     <TableHead className="text-slate-400">代號／權證／層級 <DataTag type="AUTO" /></TableHead>
                     <TableHead className="text-slate-400">券商</TableHead>
-                    <TableHead className="text-slate-400">天數／履約／價內外 <DataTag type="AUTO" /></TableHead>
+                    <TableHead className="text-slate-400">天數／到期／履約／價內外 <DataTag type="AUTO" /></TableHead>
                     <TableHead className="text-right text-slate-400">價格／比例</TableHead>
                     <TableHead className="text-slate-400">Delta <DataTag type={autoEnriched ? "YUANTA" : "MANUAL"} />／實質槓桿 <DataTag type="CALCULATED" /></TableHead>
                     <TableHead className="text-slate-400">流通比／成交量 <DataTag type={autoEnriched ? "YUANTA" : "MANUAL"} /></TableHead>
@@ -801,8 +799,8 @@ export default function Home() {
                           <div className="mt-1"><LevelBadge level={row.selectionLevel} /></div>
                         </TableCell>
                         <TableCell className="text-slate-300">{row.issuer ?? inferIssuer(row.name) ?? "待補"}</TableCell>
-                        <TableCell><div className="font-mono">{row.days === null ? "待補" : `${row.days} 天`}</div><div className="text-xs text-slate-500">履約 {fmt(row.strike)}｜{row.moneyness === null ? "價內外待補" : `${row.moneyness > 0 ? "+" : ""}${fmt(row.moneyness, 1)}%`}</div></TableCell>
-                        <TableCell className="text-right font-mono"><div>{gearingPrice.price === null ? "報價不完整" : `${fmt(gearingPrice.price, 2)} 元`}</div><div className="text-xs text-slate-500">比例 {fmt(row.ratio, 4)}</div><div className="text-[10px] text-slate-600">理論槓桿 {theoreticalGearing(row) === null ? "待補" : `${fmt(theoreticalGearing(row), 2)}×`}</div></TableCell>
+                        <TableCell><div className="font-mono">{row.days === null ? "待補" : `${row.days} 天（含今日）`}</div><div className="text-[10px] text-slate-600">到期 {row.expiry ?? "待補"}</div><div className="text-xs text-slate-500">履約 {fmt(row.strike)}｜{row.moneyness === null ? "價內外待補" : `${row.moneyness > 0 ? "+" : ""}${fmt(row.moneyness, 1)}%`}</div></TableCell>
+                        <TableCell className="text-right font-mono"><div>{gearingPrice.price === null || gearingPrice.source === null ? "報價不完整" : `${fmtWarrantPrice(gearingPrice.price, gearingPrice.source)} 元`}</div><div className="text-xs text-slate-500">比例 {fmt(row.ratio, 4)}</div><div className="text-[10px] text-slate-600">理論槓桿 {theoreticalGearing(row) === null ? "待補" : `${fmt(theoreticalGearing(row), 2)}×`}</div></TableCell>
                         <TableCell><div className="flex items-center gap-1"><Input aria-label={`${row.code} 原始 Delta`} inputMode="decimal" value={row.delta ?? ""} onChange={(e) => update(row.code, "delta", e.target.value)} placeholder={item.deltaSource === "model" ? fmt(item.resolvedRawDelta, 5) : "原始 Δ"} className="h-9 w-20 border-amber-400/20 bg-amber-400/5 font-mono" />{item.deltaSource === "yuanta" && <Badge variant="outline" className="border-emerald-400/30 text-[9px] text-emerald-300">YUANTA</Badge>}{item.deltaSource === "model" && <Badge variant="outline" className="border-violet-400/30 text-[9px] text-violet-300">MODEL</Badge>}{item.deltaSource === "manual" && <Badge variant="outline" className="border-amber-400/30 text-[9px] text-amber-300">MANUAL</Badge>}</div><div className="mt-1 text-xs font-mono text-violet-300">標準化 {fmt(item.normalizedDelta, 3)}｜{gearingPrice.source === null ? "報價不完整" : item.gearing === null ? "槓桿待補" : `${fmt(item.gearing, 2)}×`}</div><div className={`mt-0.5 text-[10px] ${gearingPrice.source === "last" ? "text-amber-300" : gearingPrice.source === null ? "text-rose-300" : "text-slate-600"}`}>{gearingLabel}</div></TableCell>
                         <TableCell><div className="flex gap-1"><Input aria-label={`${row.code} 在外流通比`} inputMode="decimal" value={row.outstandingRatio ?? ""} onChange={(e) => update(row.code, "outstandingRatio", e.target.value)} placeholder="流通 %" className="h-9 w-20 font-mono" /><Input aria-label={`${row.code} 成交量`} inputMode="numeric" value={row.volume ?? ""} onChange={(e) => update(row.code, "volume", e.target.value)} placeholder="成交張" className="h-9 w-20 font-mono" /></div></TableCell>
                         <TableCell><div className="flex gap-1"><Input aria-label={`${row.code} Bid`} inputMode="decimal" value={row.bid ?? ""} onChange={(e) => update(row.code, "bid", e.target.value)} placeholder="Bid" className="h-9 w-20 font-mono" /><Input aria-label={`${row.code} Ask`} inputMode="decimal" value={row.ask ?? ""} onChange={(e) => update(row.code, "ask", e.target.value)} placeholder="Ask" className="h-9 w-20 font-mono" /></div>{row.quoteAt && <div className="mt-1 text-[10px] text-slate-600">{new Date(row.quoteAt).toLocaleTimeString("zh-TW", { hour: "2-digit", minute: "2-digit" })}</div>}</TableCell>
