@@ -205,10 +205,18 @@ export function normalizedDelta(row: Warrant) {
 }
 
 export function warrantPrice(row: Warrant) {
+  return warrantPriceResolution(row).price;
+}
+
+export function warrantPriceResolution(row: Warrant): { price: number | null; source: "mid" | "last" | null } {
   const bid = numberValue(row.bid);
   const ask = numberValue(row.ask);
-  if (bid !== null && ask !== null && bid >= 0 && ask >= bid) return (bid + ask) / 2;
-  return row.lastPrice ?? null;
+  if (bid !== null && ask !== null && bid >= 0 && ask >= bid) {
+    return { price: (bid + ask) / 2, source: "mid" };
+  }
+  const last = numberValue(row.lastPrice);
+  if (last !== null && last > 0) return { price: last, source: "last" };
+  return { price: null, source: null };
 }
 
 export function tickSize(price: number | null) {
@@ -236,11 +244,6 @@ export function spread(row: Warrant) {
 }
 
 export function effectiveGearing(row: Warrant) {
-  const edited = new Set(row.userEditedFields ?? []);
-  if (row.reportedGearing !== null && row.reportedGearing !== undefined &&
-    !edited.has("delta") && !edited.has("bid") && !edited.has("ask")) {
-    return row.reportedGearing;
-  }
   const price = warrantPrice(row);
   const spot = row.underlyingPrice ?? null;
   const delta = deltaResolution(row).raw;
