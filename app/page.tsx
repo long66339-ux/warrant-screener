@@ -773,7 +773,7 @@ export default function Home() {
                     <TableHead className="text-slate-400">券商</TableHead>
                     <TableHead className="text-slate-400">天數／履約／價內外 <DataTag type="AUTO" /></TableHead>
                     <TableHead className="text-right text-slate-400">價格／比例</TableHead>
-                    <TableHead className="text-slate-400">Delta／實質槓桿 <DataTag type={autoEnriched ? "YUANTA" : "MANUAL"} /></TableHead>
+                    <TableHead className="text-slate-400">Delta <DataTag type={autoEnriched ? "YUANTA" : "MANUAL"} />／實質槓桿 <DataTag type="CALCULATED" /></TableHead>
                     <TableHead className="text-slate-400">流通比／成交量 <DataTag type={autoEnriched ? "YUANTA" : "MANUAL"} /></TableHead>
                     <TableHead className="text-slate-400">Bid / Ask <DataTag type={autoEnriched ? "YUANTA" : "MANUAL"} /></TableHead>
                     <TableHead className="text-slate-400">買一／賣一量</TableHead>
