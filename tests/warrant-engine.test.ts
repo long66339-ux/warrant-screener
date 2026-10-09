@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  aggressiveGearingStatus,
   deltaResolution,
   earliestSelectionLevel,
   estimatedNormalizedDelta,
@@ -156,6 +157,38 @@ test("積極型初篩使用理論槓桿與目標 Delta 推估實質槓桿潛力"
 test("積極型實質槓桿未達 5 倍時會明確警告", () => {
   const scored = scoreRows([warrant("LOW-GEAR", { delta: "0.024", bid: "1.99", ask: "2.01" })], "aggressive")[0];
   assert.ok(scored.warnings.some((warning) => warning.includes("未達積極型 5 倍下限")));
+});
+
+test("積極型摘要有 Delta 時以實際槓桿判斷是否達標，不拿潛力混充", () => {
+  const rows = [warrant("A", {
+    underlyingPrice: 1965,
+    ratio: 0.006,
+    delta: "0.0022",
+    bid: "1.09",
+    ask: "1.11",
+  })];
+  const status = aggressiveGearingStatus(rows);
+  assert.equal(status.basis, "actual");
+  assert.ok((status.actualMax ?? 0) < 5);
+  assert.ok((status.potentialMax ?? 0) > 5);
+  assert.equal(status.reachesTarget, false);
+});
+
+test("低波動率成本型在品質池提高相對 IV 權重", () => {
+  const rows = Array.from({ length: 9 }, (_, index) => warrant(`W${index}`, {
+    days: 120 + index,
+    moneyness: index / 10,
+    iv: index === 0 ? "30" : "50",
+    delta: "0.04",
+    bid: "1.99",
+    ask: "2.01",
+    bidQty: "200",
+    askQty: "200",
+  }));
+  const balanced = pickInitialCandidates(rows, "balanced", 8).candidates.map((row) => row.code);
+  const lowCost = pickInitialCandidates(rows, "lowCost", 8).candidates.map((row) => row.code);
+  assert.ok(lowCost.includes("W0"));
+  assert.notDeepEqual(lowCost, balanced);
 });
 
 test("初選50檔後會用同標的相對 IV、Delta 與造市品質縮成20檔", () => {
