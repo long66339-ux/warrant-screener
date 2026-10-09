@@ -4,10 +4,12 @@ import {
   deltaResolution,
   earliestSelectionLevel,
   estimatedNormalizedDelta,
+  effectiveGearing,
   hardExclusionReasons,
   peerMedianIv,
   pickInitialCandidates,
   scoreRows,
+  warrantPriceResolution,
   type Warrant,
 } from "../lib/warrant-engine.ts";
 
@@ -81,6 +83,29 @@ test("輸入 IV 後可用 Black–Scholes 自動估算 Delta，人工值優先�
   const manual = { ...modeled, delta: "0.032" };
   assert.equal(deltaResolution(manual).source, "manual");
   assert.equal(deltaResolution(manual).normalized, 0.4);
+});
+
+test("實質槓桿一律以畫面採用的權證價格自行計算，不直接採元大欄位", () => {
+  const row = warrant("086042", {
+    underlyingPrice: 1965,
+    ratio: 0.009,
+    delta: "0.0039",
+    bid: "1.14",
+    ask: "",
+    lastPrice: 2.68,
+    reportedGearing: 6.7859,
+  });
+  assert.deepEqual(warrantPriceResolution(row), { price: 2.68, source: "last" });
+  assert.ok(Math.abs((effectiveGearing(row) ?? 0) - 2.859) < 0.001);
+});
+
+test("Bid 或 Ask 缺失時使用成交價，連成交價也沒有才視為報價不完整", () => {
+  const lastPriceRow = warrant("LAST", { bid: "1.8", ask: "", lastPrice: 2 });
+  assert.deepEqual(warrantPriceResolution(lastPriceRow), { price: 2, source: "last" });
+
+  const incomplete = warrant("NONE", { bid: "1.8", ask: "", lastPrice: null, delta: "0.04" });
+  assert.deepEqual(warrantPriceResolution(incomplete), { price: null, source: null });
+  assert.equal(effectiveGearing(incomplete), null);
 });
 
 test("IV 異常值使用相近日數、Delta 與價內外權證的中位數", () => {
